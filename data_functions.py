@@ -79,14 +79,19 @@ def neg_sharpe_ratio(weights, mean_rets, cov_rets, rf):
     p_ret, p_std = portfolio_performance(mean_rets, cov_rets, weights)
     return -(p_ret - rf) / p_std
 
-def get_init_port(return_df, risk_free_rate):
+def get_init_port(return_df, risk_free_rate, leverage_limit=1.0):
     mean_rets = return_df.mean()
     cov_rets = return_df.cov()
     
-    constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
-    bounds = tuple((0, 1) for _ in range(len(return_df.columns)))
-    init_weights = np.ones(len(return_df.columns)) / len(return_df.columns)
+    # Constraint: Sum of absolute weights <= leverage limit (e.g., 1 for 100% of capital)
+    constraints = {'type': 'eq', 'fun': lambda x: leverage_limit - np.sum(np.abs(x))}
     
+    # Bounds: allowing weights from -leverage_limit to leverage_limit per asset
+    bounds = tuple((-leverage_limit, leverage_limit) for _ in range(len(return_df.columns)))
+    
+    # Initial weights: Start from equally distributed across all assets (considering both long and short possibilities)
+    init_weights = np.array([leverage_limit / len(return_df.columns)] * len(return_df.columns))
+
     opt_results = minimize(neg_sharpe_ratio, init_weights, args=(mean_rets, cov_rets, risk_free_rate),
                            method='SLSQP', bounds=bounds, constraints=constraints)
     
