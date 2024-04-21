@@ -6,6 +6,7 @@ from scipy.optimize import minimize
 from scipy.stats import norm  # If you have a normal approximation
 from datetime import datetime
 import pandas_market_calendars as mcal
+import QuantLib as ql
 
 '''
 Data Input and Manipulation:
@@ -38,33 +39,23 @@ def get_log_returns(price_df):
 
     return log_returns
 
-def options_chain(symbol, start_date, end_date):
-    tk = yf.Ticker(symbol)
-    exps = tk.options
-    
-    exps = [e for e in exps if start_date <= pd.to_datetime(e) <= end_date]
+def days_to_expiration(ticker, symbol):
+    date_part = symbol[len(ticker):]  # Assumes date part starts right after the ticker
+    exp_year = int(date_part[0:2]) + 2000
+    exp_month = int(date_part[2:4])
+    exp_day = int(date_part[4:6])
+    return exp_day, exp_month, exp_year
 
-    options = pd.DataFrame()
-    for e in exps:
-        opt = tk.option_chain(e)
-        opt_calls = pd.DataFrame(opt.calls)
-        opt_puts = pd.DataFrame(opt.puts)
-        opt_combined = pd.concat([opt_calls, opt_puts])
-        opt_combined['expirationDate'] = e
-        options = pd.concat([options, opt_combined], ignore_index=True)
+def get_options_data(symbol):
+    ticker = yf.Ticker(symbol)
+    opts = ticker.option_chain()
+    calls = opts.calls
+    puts = opts.puts
 
-    options['expirationDate'] = pd.to_datetime(options['expirationDate']) + datetime.timedelta(days=1)
-    options['dte'] = (options['expirationDate'] - pd.to_datetime(datetime.datetime.now().date())).dt.days / 365
+    calls[['Day', 'Month', 'Year']] = calls['contractSymbol'].apply(lambda x: days_to_expiration(symbol, x)).apply(pd.Series)
+    puts[['Day', 'Month', 'Year']] = puts['contractSymbol'].apply(lambda x: days_to_expiration(symbol, x)).apply(pd.Series)
     
-    options['CALL'] = options['contractSymbol'].str[4:].apply(lambda x: "C" in x)
-    
-    options[['bid', 'ask', 'strike']] = options[['bid', 'ask', 'strike']].apply(pd.to_numeric, errors='coerce')
-    options['mark'] = (options['bid'] + options['ask']) / 2
-    
-    options = options.drop(columns=['contractSize', 'currency', 'change', 'percentChange', 'lastTradeDate', 'lastPrice'])
-    
-    return options
-
+    return calls, puts
 
 '''
 Initial Optimzation Model:
@@ -102,8 +93,9 @@ def get_init_port(return_df, risk_free_rate, leverage_limit=1.0):
 
 
 '''
-Simulation Methods:
+Geometric Brownian Motion (GBM) Methods:
 '''
+
 def simulate_gbm(S0, mu, sigma, T, dt=1/252, N=1000):
     num_steps = int(T / dt)  # Number of time steps for the given number of years
     t = np.linspace(0, T, num_steps + 1)  # Time vector from 0 to T years
@@ -135,6 +127,9 @@ def simulate_gbm_portfolio(returns_df,stock_df,weights,T=1,dt=1/252,N=10000):
     
     return pd.DataFrame(portfolio_paths, columns=np.arange(0, T+dt, dt))
 
+'''
+Merton Jump Diffusion:
+'''
 
 def estimate_merton_params(ret_series):
     z_scores=(ret_series-np.mean(ret_series))/(np.std(ret_series))
@@ -197,6 +192,10 @@ def negative_log_likelihood(params, data):
         S = S_next
     return -likelihood_acc
 
+'''
+Constant Elasticity of Variance (CEV) Model:
+'''
+
 def estimate_cev_params(stock_series):
     initial_guess = [0.0001, 0.2, 0.5]
     bounds = [(None, None), (1e-5, None), (0, 2)]  # Bounds for mu, sigma, beta
@@ -233,3 +232,101 @@ def simulate_cev_portfolio(stock_df, weights, T=1, dt=1/252, N=10000):
         portfolio_paths += weight * S
 
     return pd.DataFrame(portfolio_paths, columns=np.linspace(0, T, int(T/dt)+1))
+
+'''
+Heston Model:
+'''
+
+def estimate_heston_params(ticker,end_date,stock_df,risk_free_rate):
+    calls,puts=get_options_data(ticker)
+    today=ql.Date(end_date.day,end_date.month,end_date.year)
+    calendar = ql.UnitedStates(ql.UnitedStates.NYSE)
+    day_count = ql.Actual365Fixed()
+    try:
+        dividend_rate=yf.Ticker(ticker).info['dividendYield']
+    except KeyError:
+        dividend_rate=0
+
+    spot_handle = ql.QuoteHandle(ql.SimpleQuote(stock_df[ticker].iloc[-1]))
+    rate_handle = ql.YieldTermStructureHandle(ql.FlatForward(today, risk_free_rate, day_count))
+    dividend_handle = ql.YieldTermStructureHandle(ql.FlatForward(today, dividend_rate, day_count))
+
+    v0_init = 0.01  # initial variance
+    kappa_init = 0.2  # rate of mean reversion
+    theta_init = 0.02  # long-term variance
+    sigma_init = 0.5  # volatility of volatility
+    rho_init = -0.75  # correlation between the two Brownian motions
+
+    process = ql.HestonProcess(rate_handle, dividend_handle, spot_handle, v0_init, kappa_init, theta_init, sigma_init, rho_init)
+    model = ql.HestonModel(process)
+    engine = ql.AnalyticHestonEngine(model,128)
+
+    helpers = []
+    options_data = [(calls, ql.Option.Call), (puts, ql.Option.Put)]
+
+    for option_df, opt_type in options_data:
+        for index, row in option_df.iterrows():
+            strike = row['strike']
+            mid_price = row['lastPrice']
+            maturity_date = ql.Date(row['Day'], row['Month'], row['Year'])
+            underlying=stock_df[ticker].asof(row['lastTradeDate'].strftime('%Y-%m-%d'))
+            last_date=ql.Date(row['lastTradeDate'].day,row['lastTradeDate'].month,row['lastTradeDate'].year)
+            t = maturity_date-last_date
+            
+            payoff = ql.PlainVanillaPayoff(opt_type, strike)
+            exercise = ql.EuropeanExercise(maturity_date)
+            helper = ql.HestonModelHelper(ql.Period(int(t), ql.Days), calendar, underlying, strike, ql.QuoteHandle(ql.SimpleQuote(mid_price)), rate_handle, dividend_handle)
+            helper.setPricingEngine(engine)
+            helpers.append(helper)
+
+    cost_thresh=1.3
+    helpers=[help for help in helpers if (np.abs(help.calibrationError())<cost_thresh)]
+
+
+    for i, helper in enumerate(helpers):
+        cost_pre = helper.calibrationError()
+        #print(f"Pre-calibration cost for helper {i}: {cost_pre}")
+
+    method = ql.LevenbergMarquardt()
+    model.calibrate(helpers, method, ql.EndCriteria(1000, 500, 1e-8, 1e-8, 1e-8))
+
+    theta, kappa, sigma, rho, v0 = model.params()
+    print(f"Calibrated {ticker} parameters: theta={theta}, kappa={kappa}, sigma={sigma}, rho={rho}, v0={v0}")
+    return theta, kappa, sigma, rho, v0
+
+
+def simulate_heston(params, S0, r, T=1, dt=1/252, N=1000):
+    theta, kappa, sigma, rho, v0 = params
+    num_steps = int(T / dt)  # Ensure num_steps is an integer
+
+    # Define the risk-free rate curve
+    riskFreeRate = ql.FlatForward(0, ql.NullCalendar(), ql.QuoteHandle(ql.SimpleQuote(r)), ql.Actual365Fixed())
+    riskFreeRateHandle = ql.YieldTermStructureHandle(riskFreeRate)
+
+    # Setup the Heston process
+    heston_process = ql.HestonProcess(riskFreeRateHandle,
+                                      ql.YieldTermStructureHandle(ql.FlatForward(0, ql.NullCalendar(), 0, ql.Actual365Fixed())),
+                                      ql.QuoteHandle(ql.SimpleQuote(S0)),
+                                      v0, kappa, theta, sigma, rho)
+
+    # Create the Heston model
+    heston_model = ql.HestonModel(heston_process)
+
+    # Setup the random number generator
+    rng = ql.UniformRandomGenerator()
+    dimension = 2  # Two dimensions for the Heston model (asset price and variance)
+    sequence_generator = ql.GaussianRandomSequenceGenerator(
+        ql.UniformRandomSequenceGenerator(dimension * num_steps, rng))  # Correct dimensionality
+    time_grid = ql.TimeGrid(T, num_steps)
+    path_generator = ql.GaussianMultiPathGenerator(
+        heston_process, time_grid, sequence_generator, False)
+    
+    # Generate the paths
+    paths = []
+    for i in range(N):
+        sample_path = path_generator.next()
+        multi_path = sample_path.value()
+        asset_path = [multi_path[0][j] for j in range(num_steps)]  # Path for the stock price
+        paths.append(asset_path)
+    
+    return pd.DataFrame(paths)
