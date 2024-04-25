@@ -74,13 +74,10 @@ def get_init_port(return_df, risk_free_rate, leverage_limit=1.0):
     mean_rets = return_df.mean()
     cov_rets = return_df.cov()
     
-    # Constraint: Sum of absolute weights <= leverage limit (e.g., 1 for 100% of capital)
     constraints = {'type': 'eq', 'fun': lambda x: leverage_limit - np.sum(np.abs(x))}
     
-    # Bounds: allowing weights from -leverage_limit to leverage_limit per asset
     bounds = tuple((-leverage_limit, leverage_limit) for _ in range(len(return_df.columns)))
     
-    # Initial weights: Start from equally distributed across all assets (considering both long and short possibilities)
     init_weights = np.array([leverage_limit / len(return_df.columns)] * len(return_df.columns))
 
     opt_results = minimize(neg_sharpe_ratio, init_weights, args=(mean_rets, cov_rets, risk_free_rate),
@@ -297,7 +294,7 @@ def estimate_heston_params(ticker,end_date,stock_df,risk_free_rate):
 
 def simulate_heston(params, S0, r, T=1, dt=1/252, N=1000):
     theta, kappa, sigma, rho, v0 = params
-    num_steps = int(T / dt)  # Ensure num_steps is an integer
+    num_steps = int(T / dt)+1  # Ensure num_steps is an integer
 
     # Define the risk-free rate curve
     riskFreeRate = ql.FlatForward(0, ql.NullCalendar(), ql.QuoteHandle(ql.SimpleQuote(r)), ql.Actual365Fixed())
@@ -330,3 +327,16 @@ def simulate_heston(params, S0, r, T=1, dt=1/252, N=1000):
         paths.append(asset_path)
     
     return pd.DataFrame(paths)
+
+def simulate_heston_portfolio(stock_df, weights, risk_free_rate, T=1, dt=1/252, N=10000):
+    params = [estimate_heston_params(tick, stock_df.index[-1], stock_df, risk_free_rate) for tick in stock_df.columns]
+    
+    S0 = stock_df.iloc[-1]
+    num_steps = int(T / dt) + 1  # Adjusted to match the number of columns in the resulting DataFrame
+    portfolio_paths = np.zeros((N, num_steps))
+
+    for i, (param, weight) in enumerate(zip(params, weights)):
+        S = simulate_heston(param, S0[i], risk_free_rate, T, dt, N)
+        portfolio_paths += weight * S.values[:, :num_steps]  # Ensure the same number of steps in each path
+
+    return pd.DataFrame(portfolio_paths, columns=np.linspace(0, T, num_steps))
