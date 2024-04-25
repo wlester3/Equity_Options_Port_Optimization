@@ -23,7 +23,7 @@ def plot_cumulative_returns(log_returns):
 
 
 def plot_paths(S, method,with_mean=False):
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(12,8))
     plt.plot(S.T, lw=1)
     if with_mean:
         plt.plot(S.mean(axis=0), 'k', lw=2, label='Mean Path')
@@ -31,4 +31,5 @@ def plot_paths(S, method,with_mean=False):
     plt.title(f'{method} Simulations')
     plt.xlabel('Time Steps')
     plt.ylabel('Stock Price')
+    plt.grid(True)
     plt.show()

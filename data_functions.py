@@ -236,6 +236,7 @@ Heston Model:
 
 def estimate_heston_params(ticker,end_date,stock_df,risk_free_rate):
     calls,puts=get_options_data(ticker)
+
     today=ql.Date(end_date.day,end_date.month,end_date.year)
     calendar = ql.UnitedStates(ql.UnitedStates.NYSE)
     day_count = ql.Actual365Fixed()
