@@ -345,6 +345,7 @@ def simulate_heston_portfolio(stock_df, weights, risk_free_rate, T=1, dt=1/252, 
 '''
 Simulation Portfolio Optimization
 '''
+
 def calculate_sharpe_ratio_for_path(weights, returns, cov_matrix, risk_free_rate):
     portfolio_return = np.dot(weights, returns)
     excess_return = portfolio_return - risk_free_rate
