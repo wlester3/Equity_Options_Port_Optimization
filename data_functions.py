@@ -74,7 +74,7 @@ def get_init_port(return_df, risk_free_rate, leverage_limit=1.0):
     mean_rets = return_df.mean()
     cov_rets = return_df.cov()
     
-    constraints = {'type': 'eq', 'fun': lambda x: leverage_limit - np.sum(np.abs(x))}
+    constraints = {'type': 'eq', 'fun': lambda x: 1 - np.sum(np.abs(x))}
     
     bounds = tuple((-leverage_limit, leverage_limit) for _ in range(len(return_df.columns)))
     
@@ -289,7 +289,7 @@ def estimate_heston_params(ticker,end_date,stock_df,risk_free_rate):
     model.calibrate(helpers, method, ql.EndCriteria(1000, 500, 1e-8, 1e-8, 1e-8))
 
     theta, kappa, sigma, rho, v0 = model.params()
-    print(f"Calibrated {ticker} parameters: theta={theta}, kappa={kappa}, sigma={sigma}, rho={rho}, v0={v0}")
+    print(f"Estimated {ticker} Heston Parameters: theta={theta}, kappa={kappa}, sigma={sigma}, rho={rho}, v0={v0}")
     return theta, kappa, sigma, rho, v0
 
 
@@ -341,3 +341,58 @@ def simulate_heston_portfolio(stock_df, weights, risk_free_rate, T=1, dt=1/252, 
         portfolio_paths += weight * S.values[:, :num_steps]  # Ensure the same number of steps in each path
 
     return pd.DataFrame(portfolio_paths, columns=np.linspace(0, T, num_steps))
+
+'''
+Simulation Portfolio Optimization
+'''
+def calculate_sharpe_ratio_for_path(weights, returns, cov_matrix, risk_free_rate):
+    portfolio_return = np.dot(weights, returns)
+    excess_return = portfolio_return - risk_free_rate
+    portfolio_variance = np.dot(weights, np.dot(cov_matrix, weights))
+    portfolio_std_dev = np.sqrt(portfolio_variance)
+    sharpe_ratio = excess_return / portfolio_std_dev
+    return sharpe_ratio
+
+def negative_average_sharpe(weights,tickers,tick_sim_ret,risk_free_rate):
+    num_paths = tick_sim_ret[tickers[0]].shape[0]
+    sharpe_ratios = []
+    
+    for path_index in range(num_paths):
+        path_returns = np.array([tick_sim_ret[tick][path_index, :] for tick in tickers])
+        mean_returns = np.mean(path_returns, axis=1)
+        cov_matrix = np.cov(path_returns)
+    
+        sharpe_ratio = calculate_sharpe_ratio_for_path(weights, mean_returns, cov_matrix,risk_free_rate)
+        sharpe_ratios.append(sharpe_ratio)
+    
+    average_sharpe = np.mean(sharpe_ratios)
+    
+    return -average_sharpe
+
+def calculate_simulate_portfolio(tickers,end_date,stock_df,returns_df,risk_free_rate,leverage_limit,sim_num):
+    tick_sim_ret={tick:None for tick in tickers}
+
+    for tick in tickers:
+        tick_price=stock_df[tick].iloc[-1]
+        tick_ret=np.mean(returns_df[tick])*252
+        tick_std=np.std(returns_df[tick])*np.sqrt(252)
+
+        tick_gbm=simulate_gbm(tick_price,tick_ret,tick_std,1,N=sim_num)
+        t_lambda,t_m,t_v=estimate_merton_params(returns_df[tick])
+        tick_merton=simulate_merton(tick_price,tick_ret,tick_std,1,t_lambda,t_m,t_v,1/252,N=sim_num)
+        tick_cev_params=estimate_cev_params(stock_series=stock_df[tick])
+        tick_cev=simulate_cev(tick_price,tick_cev_params[0]*252,tick_cev_params[1]*np.sqrt(252), gamma=tick_cev_params[2], T=1,N=sim_num)
+        tick_heston_param=estimate_heston_params(tick,end_date,stock_df,risk_free_rate)
+        tick_heston=simulate_heston(tick_heston_param, tick_price, risk_free_rate,N=sim_num)
+
+        tick_sim=np.vstack((tick_gbm, tick_merton,tick_cev,tick_heston))
+        tick_returns = np.log(tick_sim[:, 1:]/tick_sim[:, :-1])
+        tick_sim_ret[tick]=tick_returns
+
+    constraints = {'type': 'eq', 'fun': lambda x: 1 - np.sum(np.abs(x))}
+    bounds = tuple((-leverage_limit, leverage_limit) for _ in tickers)  
+
+    initial_weights = np.array([leverage_limit / len(tickers)] * len(tickers))
+
+    result = minimize(lambda w: negative_average_sharpe(w, tickers, tick_sim_ret, risk_free_rate), initial_weights, method='SLSQP', bounds=bounds, constraints=constraints)
+    return result
